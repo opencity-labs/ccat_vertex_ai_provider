@@ -6,10 +6,26 @@ from typing import List, Type
 
 from pydantic import ConfigDict, Field
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+from langchain_google_vertexai.embeddings import GoogleEmbeddingModelType
 
 from cat.factory.llm import LLMSettings
 from cat.factory.embedder import EmbedderSettings
 from cat.mad_hatter.decorators import hook
+
+# Patch GoogleEmbeddingModelType to accept gemini-* model names
+# (langchain-google-vertexai==1.0.4 only recognises "text*" and "multimodalembedding*")
+_original_missing = GoogleEmbeddingModelType._missing_.__func__
+
+
+@classmethod
+def _patched_missing(cls, value):
+    result = _original_missing(cls, value)
+    if result is None and "gemini" in value.lower():
+        return GoogleEmbeddingModelType.TEXT
+    return result
+
+
+GoogleEmbeddingModelType._missing_ = _patched_missing
 
 
 class VertexAILocation(Enum):

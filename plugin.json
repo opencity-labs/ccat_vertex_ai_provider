@@ -1,6 +1,6 @@
 {
     "name": "Google Vertex Ai Provider",
-    "version": "0.0.2",
+    "version": "0.0.21",
     "description": "Adds Google Vertex AI as LLM and Embedding provider, using service account authentication.",
     "author_name": "OpenCity Labs",
     "author_url": "https://opencitylabs.it/",
