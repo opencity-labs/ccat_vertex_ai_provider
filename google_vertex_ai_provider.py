@@ -4,6 +4,18 @@ import tempfile
 from enum import Enum
 from typing import List, Type
 
+# google-auth 2.50.0 added CredentialsWithRegionalAccessBoundary to
+# google.auth.credentials, but Docker layer caching can leave a stale
+# compiled bytecode for that module while google/oauth2/credentials.py
+# is already at 2.50.0 and references it at import time.  The patch below
+# must run before any google.oauth2 import (including transitive ones from
+# vertexai or langchain_google_vertexai) to prevent the AttributeError.
+import google.auth.credentials as _gac
+if not hasattr(_gac, "CredentialsWithRegionalAccessBoundary"):
+    class _CredentialsWithRegionalAccessBoundary:
+        pass
+    _gac.CredentialsWithRegionalAccessBoundary = _CredentialsWithRegionalAccessBoundary
+
 import vertexai
 from google.oauth2 import service_account
 from pydantic import ConfigDict, Field
