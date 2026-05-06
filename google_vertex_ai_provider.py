@@ -4,6 +4,8 @@ import tempfile
 from enum import Enum
 from typing import List, Type
 
+import vertexai
+from google.oauth2 import service_account
 from pydantic import ConfigDict, Field
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from langchain_google_vertexai.embeddings import GoogleEmbeddingModelType
@@ -79,13 +81,25 @@ class VertexAILocation(Enum):
     GLOBAL = "global"
 
 
-def _setup_credentials(service_account_json: str):
-    """Write service account JSON to a temp file and set GOOGLE_APPLICATION_CREDENTIALS.
+def _init_vertex(service_account_json: str, project: str, location: str):
+    """Initialise the Vertex AI SDK with explicit credentials.
 
-    This is needed because langchain-google-vertexai's internal gRPC client
-    does not forward the credentials object, falling back to ADC instead.
+    langchain-google-vertexai==1.0.4 creates the embedder client via
+    TextEmbeddingModel.from_pretrained(), which reads from the global vertexai
+    SDK state rather than the credentials passed to VertexAIEmbeddings.
+    Without an explicit vertexai.init() call the SDK falls back to ADC and
+    fails when no ambient credentials are available.
+
+    GOOGLE_APPLICATION_CREDENTIALS is also set for the gRPC transport layer,
+    which does not receive the credentials object directly.
     """
     info = json.loads(service_account_json)
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    vertexai.init(project=project, location=location, credentials=credentials)
+
     cred_path = os.path.join(tempfile.gettempdir(), "gcp_sa_credentials.json")
     with open(cred_path, "w") as f:
         json.dump(info, f)
@@ -108,12 +122,10 @@ class LLMGoogleVertexAIConfig(LLMSettings):
 
     @classmethod
     def get_llm_from_config(cls, config):
-        _setup_credentials(config.pop("service_account_json"))
-        return ChatVertexAI(
-            project=config.pop("project_id").strip(),
-            location=config.pop("location").strip(),
-            **config,
-        )
+        project = config.pop("project_id").strip()
+        location = config.pop("location").strip()
+        _init_vertex(config.pop("service_account_json"), project, location)
+        return ChatVertexAI(project=project, location=location, **config)
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -137,12 +149,10 @@ class EmbedderGoogleVertexAIConfig(EmbedderSettings):
 
     @classmethod
     def get_embedder_from_config(cls, config):
-        _setup_credentials(config.pop("service_account_json"))
-        return VertexAIEmbeddings(
-            project=config.pop("project_id").strip(),
-            location=config.pop("location").strip(),
-            **config,
-        )
+        project = config.pop("project_id").strip()
+        location = config.pop("location").strip()
+        _init_vertex(config.pop("service_account_json"), project, location)
+        return VertexAIEmbeddings(project=project, location=location, **config)
 
     model_config = ConfigDict(
         json_schema_extra={
