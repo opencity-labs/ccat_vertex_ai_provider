@@ -1,2 +1,2 @@
 langchain-google-vertexai==1.0.4
-google-auth>=2.0.0
+google-auth==2.49.2
