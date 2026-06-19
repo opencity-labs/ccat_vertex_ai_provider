@@ -1,7 +1,10 @@
+import asyncio
 import json
 import os
 import tempfile
+import threading
 from enum import Enum
+from functools import partial
 from typing import List, Type
 
 # google-auth 2.50.0 added CredentialsWithRegionalAccessBoundary to
@@ -18,12 +21,14 @@ if not hasattr(_gac, "CredentialsWithRegionalAccessBoundary"):
 
 import vertexai
 from google.oauth2 import service_account
+from google.api_core.exceptions import ResourceExhausted
 from pydantic import ConfigDict, Field
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from langchain_google_vertexai.embeddings import GoogleEmbeddingModelType
 
 from cat.factory.llm import LLMSettings
 from cat.factory.embedder import EmbedderSettings
+from cat.log import log
 from cat.mad_hatter.decorators import hook
 
 # Patch GoogleEmbeddingModelType to accept gemini-* model names
@@ -118,6 +123,93 @@ def _init_vertex(service_account_json: str, project: str, location: str):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
 
+# EU regions confirmed to support Gemini LLM and embedding models
+_EU_FALLBACK_LOCATIONS = [
+    "europe-west1",
+    "europe-west2",
+    "europe-west4",
+    "europe-north1",
+    "europe-west3",
+]
+
+
+class RoundRobinChatVertexAI(ChatVertexAI):
+    """ChatVertexAI that transparently retries with a different EU region on 429."""
+
+    @classmethod
+    def create(cls, sa_json: str, project: str, location: str, **kwargs) -> "RoundRobinChatVertexAI":
+        locations = [location] + [l for l in _EU_FALLBACK_LOCATIONS if l != location]
+        instance = cls(project=project, location=location, **kwargs)
+        # ChatVertexAI uses pydantic v1 which blocks __setattr__ for unknown fields;
+        # store all mutable round-robin state in a single dict to bypass that guard.
+        object.__setattr__(instance, "_rr_state", {
+            "sa_json": sa_json,
+            "project": project,
+            "locations": locations,
+            "index": 0,
+            "lock": threading.Lock(),
+            "kwargs": kwargs,
+            # Plain ChatVertexAI (not self) for the primary region — avoids recursion in delegation
+            "clients": {location: ChatVertexAI(project=project, location=location, **kwargs)},
+        })
+        return instance
+
+    def _get_or_create_client(self, location: str) -> ChatVertexAI:
+        state = self._rr_state
+        if location not in state["clients"]:
+            _init_vertex(state["sa_json"], state["project"], location)
+            state["clients"][location] = ChatVertexAI(
+                project=state["project"], location=location, **state["kwargs"]
+            )
+        return state["clients"][location]
+
+    def _next_location(self) -> str:
+        state = self._rr_state
+        with state["lock"]:
+            state["index"] = (state["index"] + 1) % len(state["locations"])
+            return state["locations"][state["index"]]
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        state = self._rr_state
+        tried: set = set()
+        location = state["locations"][state["index"]]
+        for _ in range(len(state["locations"])):
+            if location in tried:
+                break
+            tried.add(location)
+            client = self._get_or_create_client(location)
+            try:
+                return client._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            except ResourceExhausted:
+                log.warning(f"Vertex AI LLM rate-limited on {location}, switching EU region")
+                location = self._next_location()
+        raise ResourceExhausted("All configured Vertex AI EU regions are rate-limited")
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        state = self._rr_state
+        tried: set = set()
+        location = state["locations"][state["index"]]
+        for _ in range(len(state["locations"])):
+            if location in tried:
+                break
+            tried.add(location)
+            client = self._get_or_create_client(location)
+            try:
+                yield from client._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+                return
+            except ResourceExhausted:
+                log.warning(f"Vertex AI LLM rate-limited on {location} (stream), switching EU region")
+                location = self._next_location()
+        raise ResourceExhausted("All configured Vertex AI EU regions are rate-limited")
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(self._generate, messages, stop=stop, run_manager=run_manager, **kwargs),
+        )
+
+
 # --- LLM Provider ---
 
 
@@ -136,8 +228,9 @@ class LLMGoogleVertexAIConfig(LLMSettings):
     def get_llm_from_config(cls, config):
         project = config.pop("project_id").strip()
         location = config.pop("location").strip()
-        _init_vertex(config.pop("service_account_json"), project, location)
-        return ChatVertexAI(project=project, location=location, **config)
+        sa_json = config.pop("service_account_json")
+        _init_vertex(sa_json, project, location)
+        return RoundRobinChatVertexAI.create(sa_json=sa_json, project=project, location=location, **config)
 
     model_config = ConfigDict(
         json_schema_extra={
