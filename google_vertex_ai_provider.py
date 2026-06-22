@@ -19,6 +19,18 @@ if not hasattr(_gac, "CredentialsWithRegionalAccessBoundary"):
         pass
     _gac.CredentialsWithRegionalAccessBoundary = _CredentialsWithRegionalAccessBoundary
 
+# langchain-google-vertexai (>=2.x) references ModelProfile from
+# langchain_core.language_models, which older langchain_core versions don't
+# export.  Inject a minimal stub so the import succeeds regardless of version.
+import langchain_core.language_models as _lcl
+if not hasattr(_lcl, "ModelProfile"):
+    class _ModelProfile:
+        pass
+    _lcl.ModelProfile = _ModelProfile
+    import langchain_core.language_models.base as _lcl_base
+    if not hasattr(_lcl_base, "ModelProfile"):
+        _lcl_base.ModelProfile = _ModelProfile
+
 import vertexai
 from google.oauth2 import service_account
 from google.api_core.exceptions import ResourceExhausted
