@@ -19,17 +19,90 @@ if not hasattr(_gac, "CredentialsWithRegionalAccessBoundary"):
         pass
     _gac.CredentialsWithRegionalAccessBoundary = _CredentialsWithRegionalAccessBoundary
 
-# langchain-google-vertexai (>=2.x) references ModelProfile from
-# langchain_core.language_models, which older langchain_core versions don't
-# export.  Inject a minimal stub so the import succeeds regardless of version.
+# langchain-google-vertexai>=3.x needs several symbols that only exist in
+# langchain-core>=0.3, while the base image ships langchain-core~=0.2.
+# Inject stubs for everything that chat_models.py v3.2.4 imports but that
+# 0.2.x does not export, so the plugin loads cleanly at import time.
+import sys
+import types
+import warnings
+
 import langchain_core.language_models as _lcl
-if not hasattr(_lcl, "ModelProfile"):
-    class _ModelProfile:
+import langchain_core.language_models.base as _lcl_base
+import langchain_core.messages as _lcm
+import langchain_core.utils.function_calling as _lcuf
+import langchain_core.utils.utils as _lcuu
+
+def _patch(mod, name, stub):
+    if not hasattr(mod, name):
+        setattr(mod, name, stub)
+
+# --- langchain_core.language_models ---
+class _ModelProfile:
+    pass
+class _ModelProfileRegistry:
+    pass
+_patch(_lcl, "ModelProfile", _ModelProfile)
+_patch(_lcl, "ModelProfileRegistry", _ModelProfileRegistry)
+_patch(_lcl_base, "ModelProfile", _ModelProfile)
+_patch(_lcl_base, "ModelProfileRegistry", _ModelProfileRegistry)
+
+# --- langchain_core.messages: image/content helpers ---
+def _convert_to_openai_image_block(image_data, **kwargs):
+    if isinstance(image_data, dict):
+        return image_data
+    return {"type": "image_url", "image_url": {"url": str(image_data)}}
+
+def _is_data_content_block(block):
+    if not isinstance(block, dict):
+        return False
+    return block.get("type") in ("image_url", "image", "audio_url", "audio", "video_url", "file")
+
+_patch(_lcm, "convert_to_openai_image_block", _convert_to_openai_image_block)
+_patch(_lcm, "is_data_content_block", _is_data_content_block)
+
+# --- langchain_core.messages.ai: InputTokenDetails ---
+import langchain_core.messages.ai as _lcma
+class _InputTokenDetails(dict):
+    pass
+_patch(_lcma, "InputTokenDetails", _InputTokenDetails)
+
+# --- langchain_core.messages.content sub-module ---
+if "langchain_core.messages.content" not in sys.modules:
+    _content_mod = types.ModuleType("langchain_core.messages.content")
+    sys.modules["langchain_core.messages.content"] = _content_mod
+    _lcm.content = _content_mod
+
+# --- langchain_core.utils.function_calling: convert_to_json_schema ---
+def _convert_to_json_schema(schema, *, strict=None):
+    try:
+        kw = {} if strict is None else {"strict": strict}
+        openai_tool = _lcuf.convert_to_openai_tool(schema, **kw)
+        if isinstance(openai_tool, dict) and "function" in openai_tool:
+            return openai_tool["function"].get("parameters", {})
+    except Exception:
         pass
-    _lcl.ModelProfile = _ModelProfile
-    import langchain_core.language_models.base as _lcl_base
-    if not hasattr(_lcl_base, "ModelProfile"):
-        _lcl_base.ModelProfile = _ModelProfile
+    return schema if isinstance(schema, dict) else {}
+
+_patch(_lcuf, "convert_to_json_schema", _convert_to_json_schema)
+
+# --- langchain_core.utils.utils: _build_model_kwargs ---
+def _build_model_kwargs(values, all_required_field_names):
+    extra_kwargs = values.get("model_kwargs", {})
+    for field_name in list(values):
+        if field_name in extra_kwargs:
+            raise ValueError(f"Found {field_name} supplied twice.")
+        if field_name not in all_required_field_names:
+            warnings.warn(
+                f"WARNING! {field_name} is not default parameter. "
+                f"{field_name} was transferred to model_kwargs.",
+                stacklevel=7,
+            )
+            extra_kwargs[field_name] = values.pop(field_name)
+    values["model_kwargs"] = extra_kwargs
+    return values
+
+_patch(_lcuu, "_build_model_kwargs", _build_model_kwargs)
 
 import vertexai
 from google.oauth2 import service_account
