@@ -68,8 +68,20 @@ class _InputTokenDetails(dict):
 _patch(_lcma, "InputTokenDetails", _InputTokenDetails)
 
 # --- langchain_core.messages.content sub-module ---
+# _compat.py and chat_models.py reference types from this module at class-definition
+# time (as type annotations), so the module must exist with the required names.
 if "langchain_core.messages.content" not in sys.modules:
     _content_mod = types.ModuleType("langchain_core.messages.content")
+    for _name in (
+        "ContentBlock", "DataContentBlock", "TextContentBlock",
+        "ImageContentBlock", "VideoContentBlock", "AudioContentBlock",
+        "PlainTextContentBlock", "FileContentBlock", "ReasoningContentBlock",
+        "NonStandardContentBlock", "ToolContentBlock",
+        "ToolCall", "ToolCallChunk", "InvalidToolCall",
+        "ServerToolCall", "ServerToolCallChunk", "ServerToolResult",
+        "Citation", "NonStandardAnnotation",
+    ):
+        setattr(_content_mod, _name, dict)
     sys.modules["langchain_core.messages.content"] = _content_mod
     _lcm.content = _content_mod
 
