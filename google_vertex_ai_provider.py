@@ -5,7 +5,7 @@ import tempfile
 import threading
 from enum import Enum
 from functools import partial
-from typing import List, Type
+from typing import Iterator, List, Optional, Type
 
 # google-auth 2.50.0 added CredentialsWithRegionalAccessBoundary to
 # google.auth.credentials, but Docker layer caching can leave a stale
@@ -19,108 +19,26 @@ if not hasattr(_gac, "CredentialsWithRegionalAccessBoundary"):
         pass
     _gac.CredentialsWithRegionalAccessBoundary = _CredentialsWithRegionalAccessBoundary
 
-# langchain-google-vertexai>=3.x needs several symbols that only exist in
-# langchain-core>=0.3, while the base image ships langchain-core~=0.2.
-# Inject stubs for everything that chat_models.py v3.2.4 imports but that
-# 0.2.x does not export, so the plugin loads cleanly at import time.
-import sys
-import types
-import warnings
-
-import langchain_core.language_models as _lcl
-import langchain_core.language_models.base as _lcl_base
-import langchain_core.messages as _lcm
-import langchain_core.utils.function_calling as _lcuf
-import langchain_core.utils.utils as _lcuu
-
-def _patch(mod, name, stub):
-    if not hasattr(mod, name):
-        setattr(mod, name, stub)
-
-# --- langchain_core.language_models ---
-class _ModelProfile:
-    pass
-class _ModelProfileRegistry:
-    pass
-_patch(_lcl, "ModelProfile", _ModelProfile)
-_patch(_lcl, "ModelProfileRegistry", _ModelProfileRegistry)
-_patch(_lcl_base, "ModelProfile", _ModelProfile)
-_patch(_lcl_base, "ModelProfileRegistry", _ModelProfileRegistry)
-
-# --- langchain_core.messages: image/content helpers ---
-def _convert_to_openai_image_block(image_data, **kwargs):
-    if isinstance(image_data, dict):
-        return image_data
-    return {"type": "image_url", "image_url": {"url": str(image_data)}}
-
-def _is_data_content_block(block):
-    if not isinstance(block, dict):
-        return False
-    return block.get("type") in ("image_url", "image", "audio_url", "audio", "video_url", "file")
-
-_patch(_lcm, "convert_to_openai_image_block", _convert_to_openai_image_block)
-_patch(_lcm, "is_data_content_block", _is_data_content_block)
-
-# --- langchain_core.messages.ai: InputTokenDetails ---
-import langchain_core.messages.ai as _lcma
-class _InputTokenDetails(dict):
-    pass
-_patch(_lcma, "InputTokenDetails", _InputTokenDetails)
-
-# --- langchain_core.messages.content sub-module ---
-# _compat.py and chat_models.py reference types from this module at class-definition
-# time (as type annotations), so the module must exist with the required names.
-if "langchain_core.messages.content" not in sys.modules:
-    _content_mod = types.ModuleType("langchain_core.messages.content")
-    for _name in (
-        "ContentBlock", "DataContentBlock", "TextContentBlock",
-        "ImageContentBlock", "VideoContentBlock", "AudioContentBlock",
-        "PlainTextContentBlock", "FileContentBlock", "ReasoningContentBlock",
-        "NonStandardContentBlock", "ToolContentBlock",
-        "ToolCall", "ToolCallChunk", "InvalidToolCall",
-        "ServerToolCall", "ServerToolCallChunk", "ServerToolResult",
-        "Citation", "NonStandardAnnotation",
-    ):
-        setattr(_content_mod, _name, dict)
-    sys.modules["langchain_core.messages.content"] = _content_mod
-    _lcm.content = _content_mod
-
-# --- langchain_core.utils.function_calling: convert_to_json_schema ---
-def _convert_to_json_schema(schema, *, strict=None):
-    try:
-        kw = {} if strict is None else {"strict": strict}
-        openai_tool = _lcuf.convert_to_openai_tool(schema, **kw)
-        if isinstance(openai_tool, dict) and "function" in openai_tool:
-            return openai_tool["function"].get("parameters", {})
-    except Exception:
-        pass
-    return schema if isinstance(schema, dict) else {}
-
-_patch(_lcuf, "convert_to_json_schema", _convert_to_json_schema)
-
-# --- langchain_core.utils.utils: _build_model_kwargs ---
-def _build_model_kwargs(values, all_required_field_names):
-    extra_kwargs = values.get("model_kwargs", {})
-    for field_name in list(values):
-        if field_name in extra_kwargs:
-            raise ValueError(f"Found {field_name} supplied twice.")
-        if field_name not in all_required_field_names:
-            warnings.warn(
-                f"WARNING! {field_name} is not default parameter. "
-                f"{field_name} was transferred to model_kwargs.",
-                stacklevel=7,
-            )
-            extra_kwargs[field_name] = values.pop(field_name)
-    values["model_kwargs"] = extra_kwargs
-    return values
-
-_patch(_lcuu, "_build_model_kwargs", _build_model_kwargs)
-
-import vertexai
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from google.oauth2 import service_account
-from google.api_core.exceptions import ResourceExhausted
 from pydantic import ConfigDict, Field
-from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+
+# Use langchain-core 0.2.x base classes directly to avoid the metaclass conflict
+# introduced by langchain-google-vertexai 3.x (pydantic v2) vs BaseChatModel (pydantic v1).
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.embeddings import Embeddings
 
 from cat.factory.llm import LLMSettings
 from cat.factory.embedder import EmbedderSettings
@@ -130,6 +48,7 @@ from cat.mad_hatter.decorators import hook
 
 class VertexAILocation(Enum):
     # Europe
+    EU = "eu"
     EUROPE_WEST1 = "europe-west1"
     EUROPE_WEST2 = "europe-west2"
     EUROPE_WEST3 = "europe-west3"
@@ -180,48 +99,192 @@ class VertexAILocation(Enum):
 
 
 def _init_vertex(service_account_json: str, project: str, location: str):
-    """Initialise the Vertex AI SDK with explicit credentials.
+    """Write service-account credentials to a temp file and point ADC at it.
 
-    langchain-google-vertexai==1.0.4 creates the embedder client via
-    TextEmbeddingModel.from_pretrained(), which reads from the global vertexai
-    SDK state rather than the credentials passed to VertexAIEmbeddings.
-    Without an explicit vertexai.init() call the SDK falls back to ADC and
-    fails when no ambient credentials are available.
-
-    GOOGLE_APPLICATION_CREDENTIALS is also set for the gRPC transport layer,
-    which does not receive the credentials object directly.
+    google-genai picks up Application Default Credentials automatically from
+    GOOGLE_APPLICATION_CREDENTIALS, so no vertexai.init() is needed.
     """
     info = json.loads(service_account_json)
-    credentials = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-    vertexai.init(project=project, location=location, credentials=credentials)
-
     cred_path = os.path.join(tempfile.gettempdir(), "gcp_sa_credentials.json")
     with open(cred_path, "w") as f:
         json.dump(info, f)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
 
 
-# EU regions confirmed to support Gemini LLM and embedding models
+# EU locations only: europe-west2 is London, outside the EU data residency boundary
 _EU_FALLBACK_LOCATIONS = [
+    "eu",
+    "europe-west3",
     "europe-west1",
-    "europe-west2",
     "europe-west4",
     "europe-north1",
-    "europe-west3",
 ]
 
 
-class RoundRobinChatVertexAI(ChatVertexAI):
-    """ChatVertexAI that transparently retries with a different EU region on 429."""
+def _is_rate_limited(exc: BaseException) -> bool:
+    # google-genai raises genai_errors.ClientError for all 4xx responses,
+    # not google.api_core.exceptions.ResourceExhausted (that's the old
+    # vertexai/gRPC SDK's exception, which this REST-based client never raises).
+    return isinstance(exc, genai_errors.ClientError) and exc.code == 429
+
+
+class VertexAIRateLimited(RuntimeError):
+    """Raised when every configured EU region is still rate-limited after retries."""
+
+
+# Quick exponential-backoff retry within a single region before the caller
+# falls back to the next EU region on persistent rate limiting.
+_retry_on_rate_limit = retry(
+    retry=retry_if_exception(_is_rate_limited),
+    wait=wait_random_exponential(min=1, max=60),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+
+
+class GeminiVertexAIChat(BaseChatModel):
+    """LLM backed by Google Vertex AI via the google-genai SDK.
+
+    Inherits only from BaseChatModel (langchain-core 0.2.x, pydantic v1) so
+    there is no metaclass conflict with the pydantic v2-based classes in
+    langchain-google-vertexai 3.x.  All API calls go through google-genai
+    which uses the modern Gemini REST endpoint — no deprecated Model Garden API.
+    """
+
+    project: str = ""
+    location: str = "europe-west1"
+    model_name: str = "gemini-2.5-flash"
+    temperature: float = 0.7
+    max_output_tokens: int = 8192
+    streaming: bool = True
+
+    @property
+    def _llm_type(self) -> str:
+        return "gemini-vertexai"
+
+    def _get_client(self) -> genai.Client:
+        return genai.Client(vertexai=True, project=self.project, location=self.location)
+
+    @staticmethod
+    def _to_genai_contents(messages: List[BaseMessage]) -> List[genai_types.Content]:
+        contents = []
+        for msg in messages:
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            role = "model" if isinstance(msg, AIMessage) else "user"
+            contents.append(
+                genai_types.Content(role=role, parts=[genai_types.Part.from_text(text=text)])
+            )
+        return contents
+
+    def _build_config(
+        self, messages: List[BaseMessage], stop: Optional[List[str]] = None
+    ) -> tuple:
+        system_parts = []
+        chat_msgs: List[BaseMessage] = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                system_parts.append(genai_types.Part.from_text(text=text))
+            else:
+                chat_msgs.append(msg)
+
+        config_kw: dict = dict(
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
+        )
+        if system_parts:
+            config_kw["system_instruction"] = genai_types.Content(parts=system_parts)
+        if stop:
+            config_kw["stop_sequences"] = stop
+        return genai_types.GenerateContentConfig(**config_kw), chat_msgs
+
+    @_retry_on_rate_limit
+    def _call_generate_content(self, client, contents, config):
+        return client.models.generate_content(
+            model=self.model_name,
+            contents=contents,
+            config=config,
+        )
+
+    @_retry_on_rate_limit
+    def _call_generate_content_stream(self, client, contents, config):
+        return client.models.generate_content_stream(
+            model=self.model_name,
+            contents=contents,
+            config=config,
+        )
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        client = self._get_client()
+        config, chat_msgs = self._build_config(messages, stop)
+        response = self._call_generate_content(
+            client, self._to_genai_contents(chat_msgs), config
+        )
+        text = response.text or ""
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
+
+    def _stream(
+        self, messages, stop=None, run_manager=None, **kwargs
+    ) -> Iterator[ChatGenerationChunk]:
+        client = self._get_client()
+        config, chat_msgs = self._build_config(messages, stop)
+        for chunk in self._call_generate_content_stream(
+            client, self._to_genai_contents(chat_msgs), config
+        ):
+            text = chunk.text or ""
+            if text:
+                if run_manager:
+                    run_manager.on_llm_new_token(text)
+                yield ChatGenerationChunk(message=AIMessageChunk(content=text))
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(self._generate, messages, stop=stop, run_manager=run_manager, **kwargs),
+        )
+
+
+class GeminiVertexAIEmbeddings(Embeddings):
+    """Embeddings backed by Google Vertex AI via the google-genai SDK."""
+
+    def __init__(
+        self, project: str, location: str, model_name: str = "gemini-embedding-001", **kwargs
+    ):
+        self.project = project
+        self.location = location
+        self.model_name = model_name
+
+    def _get_client(self) -> genai.Client:
+        return genai.Client(vertexai=True, project=self.project, location=self.location)
+
+    @_retry_on_rate_limit
+    def _call_embed_content(self, client, text):
+        return client.models.embed_content(
+            model=self.model_name,
+            contents=text,
+        )
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        client = self._get_client()
+        result = []
+        for text in texts:
+            response = self._call_embed_content(client, text)
+            result.append(list(response.embeddings[0].values))
+        return result
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+
+
+class RoundRobinChatVertexAI(GeminiVertexAIChat):
+    """GeminiVertexAIChat that transparently retries with a different EU region on 429."""
 
     @classmethod
     def create(cls, sa_json: str, project: str, location: str, **kwargs) -> "RoundRobinChatVertexAI":
         locations = [location] + [l for l in _EU_FALLBACK_LOCATIONS if l != location]
         instance = cls(project=project, location=location, **kwargs)
-        # ChatVertexAI uses pydantic v1 which blocks __setattr__ for unknown fields;
+        # BaseChatModel uses pydantic v1 which blocks __setattr__ for unknown fields;
         # store all mutable round-robin state in a single dict to bypass that guard.
         object.__setattr__(instance, "_rr_state", {
             "sa_json": sa_json,
@@ -230,16 +293,15 @@ class RoundRobinChatVertexAI(ChatVertexAI):
             "index": 0,
             "lock": threading.Lock(),
             "kwargs": kwargs,
-            # Plain ChatVertexAI (not self) for the primary region — avoids recursion in delegation
-            "clients": {location: ChatVertexAI(project=project, location=location, **kwargs)},
+            "clients": {location: GeminiVertexAIChat(project=project, location=location, **kwargs)},
         })
         return instance
 
-    def _get_or_create_client(self, location: str) -> ChatVertexAI:
+    def _get_or_create_client(self, location: str) -> GeminiVertexAIChat:
         state = self._rr_state
         if location not in state["clients"]:
             _init_vertex(state["sa_json"], state["project"], location)
-            state["clients"][location] = ChatVertexAI(
+            state["clients"][location] = GeminiVertexAIChat(
                 project=state["project"], location=location, **state["kwargs"]
             )
         return state["clients"][location]
@@ -261,10 +323,12 @@ class RoundRobinChatVertexAI(ChatVertexAI):
             client = self._get_or_create_client(location)
             try:
                 return client._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-            except ResourceExhausted:
+            except genai_errors.ClientError as e:
+                if not _is_rate_limited(e):
+                    raise
                 log.warning(f"Vertex AI LLM rate-limited on {location}, switching EU region")
                 location = self._next_location()
-        raise ResourceExhausted("All configured Vertex AI EU regions are rate-limited")
+        raise VertexAIRateLimited("All configured Vertex AI EU regions are rate-limited")
 
     def _stream(self, messages, stop=None, run_manager=None, **kwargs):
         state = self._rr_state
@@ -278,10 +342,12 @@ class RoundRobinChatVertexAI(ChatVertexAI):
             try:
                 yield from client._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
                 return
-            except ResourceExhausted:
+            except genai_errors.ClientError as e:
+                if not _is_rate_limited(e):
+                    raise
                 log.warning(f"Vertex AI LLM rate-limited on {location} (stream), switching EU region")
                 location = self._next_location()
-        raise ResourceExhausted("All configured Vertex AI EU regions are rate-limited")
+        raise VertexAIRateLimited("All configured Vertex AI EU regions are rate-limited")
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         loop = asyncio.get_event_loop()
@@ -303,7 +369,7 @@ class LLMGoogleVertexAIConfig(LLMSettings):
     max_output_tokens: int = 8192
     streaming: bool = True
 
-    _pyclass: Type = ChatVertexAI
+    _pyclass: Type = GeminiVertexAIChat
 
     @classmethod
     def get_llm_from_config(cls, config):
@@ -331,14 +397,14 @@ class EmbedderGoogleVertexAIConfig(EmbedderSettings):
     service_account_json: str = Field(default="", extra={"type": "TextArea"})
     model_name: str = "gemini-embedding-001"
 
-    _pyclass: Type = VertexAIEmbeddings
+    _pyclass: Type = GeminiVertexAIEmbeddings
 
     @classmethod
     def get_embedder_from_config(cls, config):
         project = config.pop("project_id").strip()
         location = config.pop("location").strip()
         _init_vertex(config.pop("service_account_json"), project, location)
-        return VertexAIEmbeddings(project=project, location=location, **config)
+        return GeminiVertexAIEmbeddings(project=project, location=location, **config)
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -362,3 +428,15 @@ def factory_allowed_llms(allowed: List, cat) -> List:
 def factory_allowed_embedders(allowed: List, cat) -> List:
     allowed.append(EmbedderGoogleVertexAIConfig)
     return allowed
+
+
+# Expose a fake langchain_google_vertexai module so that code checking
+# isinstance(cat._llm, ChatVertexAI) — e.g. audio_guardian.py — still works
+# even though langchain-google-vertexai is not installed in this patched image.
+import sys as _sys
+import types as _types
+
+if "langchain_google_vertexai" not in _sys.modules:
+    _fake = _types.ModuleType("langchain_google_vertexai")
+    _fake.ChatVertexAI = GeminiVertexAIChat
+    _sys.modules["langchain_google_vertexai"] = _fake
